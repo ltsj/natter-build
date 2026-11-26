@@ -1,0 +1,108 @@
+name: build
+on:
+  workflow_dispatch:
+    inputs:
+      audit_certificate:
+        description: Base64 DER of the one-time maintainer audit certificate (public key only)
+        required: true
+        type: string
+      platform:
+        description: Platform to build (use a single platform to retry an unsuccessful job)
+        type: choice
+        default: all
+        options: [all, linux-x86_64, windows-x86_64, android-arm64-v8a]
+permissions:
+  contents: read
+concurrency:
+  group: public-release-build-${{ inputs.platform }}
+  cancel-in-progress: false
+jobs:
+  package:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(inputs.platform == 'all' && '["linux-x86_64","windows-x86_64","android-arm64-v8a"]' || format('["{0}"]', inputs.platform)) }}
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.platform == 'windows-x86_64' && 'windows-2025' || 'ubuntu-24.04' }}
+    environment: release
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate the audit public certificate
+        env:
+          AUDIT_CERTIFICATE: ${{ inputs.audit_certificate }}
+        run: |
+          certificate_length=${#AUDIT_CERTIFICATE}
+          (( certificate_length >= 100 && certificate_length <= 20000 ))
+          [[ "$AUDIT_CERTIFICATE" =~ ^[A-Za-z0-9+/=]+$ ]]
+          printf '%s' "$AUDIT_CERTIFICATE" | openssl base64 -d -A | openssl x509 -inform DER -noout
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        if: matrix.platform != 'android-arm64-v8a'
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        if: matrix.platform != 'android-arm64-v8a'
+        with:
+          version: 12
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        if: matrix.platform == 'android-arm64-v8a'
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd
+        if: matrix.platform == 'android-arm64-v8a'
+        with:
+          log-accepted-android-sdk-licenses: false
+      - name: Load build scripts from private source
+        env:
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key=$(mktemp)
+          hosts=$(mktemp)
+          printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$key"
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$hosts"
+          export GIT_SSH_COMMAND="ssh -i '$key' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$hosts' -o HostKeyAlgorithms=ssh-ed25519 -o ConnectTimeout=15"
+          scripts=$(mktemp -d)
+          git init -q "$scripts"
+          git -C "$scripts" fetch --depth=1 --no-tags "git@github.com:${SOURCE_REPO}.git" refs/heads/main
+          git -C "$scripts" checkout -q --detach FETCH_HEAD
+          cp -a "$scripts/ci" ./ci
+          chmod +x ./ci/*.sh
+      - name: Fetch and verify the pinned build source
+        env:
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          SOURCE_REF: ${{ secrets.SOURCE_REF }}
+          SOURCE_SHA: ${{ secrets.SOURCE_SHA }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: bash ci/fetch.sh
+      - name: Build, smoke-test, and seal the candidate for private audit
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          AUDIT_CERTIFICATE: ${{ inputs.audit_certificate }}
+          # Audit markers only; never printed and never written to a public log.
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          SOURCE_REF: ${{ secrets.SOURCE_REF }}
+          SOURCE_SHA: ${{ secrets.SOURCE_SHA }}
+        run: bash ci/package.sh
+      - name: Verify the sealed envelope carries no plaintext
+        run: |
+          test "$(find sealed -maxdepth 1 -type f | wc -l)" -eq 1
+          test -s sealed/candidate.cms
+          openssl cms -inform DER -in sealed/candidate.cms -cmsout -print | grep -q 'authEnvelopedData'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sealed-${{ matrix.platform }}
+          path: sealed/candidate.cms
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2

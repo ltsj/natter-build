@@ -1,0 +1,574 @@
+name: Release Natter
+# Trove-style automatic release: watch the private main version; when it is
+# newer than the latest public release, build all three platforms from that
+# exact commit, sign the Android APK with the pinned release certificate,
+# and publish a versioned GitHub Release. The manual sealed-candidate audit
+# workflow (build.yml) stays available and unchanged.
+
+on:
+  # 私有仓 ltsj/Natter 的 push 经统一 Worker 触发，传入准确 commit SHA。
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Full SHA of the private ltsj/Natter commit to build (blank = main HEAD)'
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: natter-release-${{ github.event.repository.name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'ltsj/natter-build' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 10
+    outputs:
+      ready: ${{ steps.version.outputs.ready }}
+      version: ${{ steps.version.outputs.version }}
+      code: ${{ steps.version.outputs.code }}
+      commit: ${{ steps.version.outputs.commit }}
+      short: ${{ steps.version.outputs.short }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Fetch private main and detect a new version
+        id: version
+        env:
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          REQUESTED_SHA: ${{ inputs.commit || '' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          scratch=$(mktemp -d)
+          trap 'rm -rf -- "$scratch"' EXIT
+          exec >"$scratch/detect.log" 2>&1
+          [[ "$SOURCE_REPO" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ ]]
+          test -n "$SOURCE_DEPLOY_KEY"
+          printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$scratch/key"
+          unset SOURCE_DEPLOY_KEY
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$scratch/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i '$scratch/key' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$scratch/known_hosts' -o HostKeyAlgorithms=ssh-ed25519 -o ConnectTimeout=15"
+          export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+          mkdir "$scratch/src" && cd "$scratch/src"
+          git init -q .
+          requested=${REQUESTED_SHA:-}
+          if [[ -n "$requested" && ! "$requested" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'commit must be a full 40-character SHA' >&2
+            exit 1
+          fi
+          ref=${requested:-refs/heads/main}
+          for attempt in 1 2 3; do
+            if git -c core.hooksPath=/dev/null fetch --depth=1 --no-tags "git@github.com:${SOURCE_REPO}.git" "$ref"; then break; fi
+            if (( attempt == 3 )); then echo '::error::Private source fetch failed'; exit 1; fi
+            sleep "$attempt"
+          done
+          commit=$(git rev-parse FETCH_HEAD)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          if [[ -n "$requested" && "$commit" != "$requested" ]]; then
+            echo "Fetched $commit but $requested was requested" >&2
+            exit 1
+          fi
+          git checkout -q --detach "$commit"
+          declared=$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' Cargo.toml)
+          [[ $(wc -l <<< "$declared") == 1 && "$declared" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          code=$(awk -F. '{print $1*10000 + $2*100 + $3}' <<< "$declared")
+          (( code > 0 && code <= 2099999999 ))
+          short=${commit:0:7}
+          tag="v$declared-g$short"
+          # 同一 commit 只发一次，重放不会撞 tag。
+          if git ls-remote --exit-code --tags "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Release for $commit already exists ($tag); nothing to build."
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo 'ready=true'
+            echo "version=$declared"
+            echo "code=$code"
+            echo "commit=$commit"
+            echo "short=$short"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          echo "Detected $declared at $commit ($tag)"
+
+  web:
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 12
+      - name: Load build scripts from private source
+        env:
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key=$(mktemp)
+          hosts=$(mktemp)
+          printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$key"
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$hosts"
+          export GIT_SSH_COMMAND="ssh -i '$key' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$hosts' -o HostKeyAlgorithms=ssh-ed25519 -o ConnectTimeout=15"
+          scripts=$(mktemp -d)
+          git init -q "$scripts"
+          git -C "$scripts" fetch --depth=1 --no-tags "git@github.com:${SOURCE_REPO}.git" refs/heads/main
+          git -C "$scripts" checkout -q --detach FETCH_HEAD
+          cp -a "$scripts/ci" ./ci
+          chmod +x ./ci/*.sh
+      - name: Fetch and verify the detected commit
+        env:
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          SOURCE_REF: main
+          SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: bash ci/fetch.sh
+      - name: Expose lockfiles for dependency cache
+        run: |
+          set -euo pipefail
+          mkdir -p web apps/desktop
+          cp "$RUNNER_TEMP/natter-src/web/pnpm-lock.yaml" web/pnpm-lock.yaml
+          cp "$RUNNER_TEMP/natter-src/apps/desktop/pnpm-lock.yaml" apps/desktop/pnpm-lock.yaml
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          cache: pnpm
+          cache-dependency-path: |
+            web/pnpm-lock.yaml
+            apps/desktop/pnpm-lock.yaml
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ${{ runner.temp }}/natter-src -> target
+          cache-targets: false
+      - name: Build web and voice WASM once
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/natter-src"
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-pack --version 0.13.1 --locked
+          pnpm -C web install --frozen-lockfile
+          (cd web && node --input-type=module -e '
+            import {readFile, writeFile} from "node:fs/promises";
+            import {transformWithEsbuild} from "vite";
+            for (const f of ["public/sw.js", "public/theme-boot.js"]) {
+              const {code} = await transformWithEsbuild(await readFile(f, "utf8"), f,
+                {loader:"js", minify:true, legalComments:"inline", sourcemap:false});
+              await writeFile(f, code);
+            }')
+          stage=web
+          pnpm -C web run build:voice-wasm
+          python "$GITHUB_WORKSPACE/ci/strip-wasm.py" web/src/new/wasm/natter_voice_core_bg.wasm
+          python "$GITHUB_WORKSPACE/ci/audit.py" wasm web/src/new/wasm/natter_voice_core_bg.wasm > /dev/null
+          (cd web && node --import ./scripts/init-wasm-tests.mjs --test)
+          pnpm -C web exec vite build
+          rm -rf web/dist/.vite
+          python "$GITHUB_WORKSPACE/ci/audit.py" scan-tree web/dist > /dev/null
+          cp -a web/dist "$RUNNER_TEMP/web-dist-linux"
+          pnpm -C web exec vite build --mode desktop
+          rm -rf web/dist/.vite
+          python "$GITHUB_WORKSPACE/ci/audit.py" scan-tree web/dist > /dev/null
+          mkdir -p "$GITHUB_WORKSPACE/out/wasm" "$GITHUB_WORKSPACE/out/linux" "$GITHUB_WORKSPACE/out/desktop"
+          cp web/src/new/wasm/natter_voice_core_bg.wasm "$GITHUB_WORKSPACE/out/wasm/"
+          cp -a "$RUNNER_TEMP/web-dist-linux/." "$GITHUB_WORKSPACE/out/linux/"
+          cp -a web/dist/. "$GITHUB_WORKSPACE/out/desktop/"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: web-wasm
+          path: out/wasm/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: web-linux
+          path: out/linux/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: web-desktop
+          path: out/desktop/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  build:
+    needs: [prepare, web]
+    if: needs.prepare.outputs.ready == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x86_64, linux-aarch64, windows-x86_64, android-arm64-v8a]
+    name: ${{ matrix.platform }}
+    runs-on: >-
+      ${{ matrix.platform == 'windows-x86_64' && 'windows-2025'
+          || (matrix.platform == 'linux-aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04') }}
+    environment: release
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        if: matrix.platform != 'android-arm64-v8a'
+        with:
+          version: 12
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        if: matrix.platform == 'android-arm64-v8a'
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        if: matrix.platform == 'android-arm64-v8a'
+        with:
+          log-accepted-android-sdk-licenses: false
+      - name: Load build scripts from private source
+        env:
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key=$(mktemp)
+          hosts=$(mktemp)
+          printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$key"
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$hosts"
+          export GIT_SSH_COMMAND="ssh -i '$key' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$hosts' -o HostKeyAlgorithms=ssh-ed25519 -o ConnectTimeout=15"
+          scripts=$(mktemp -d)
+          git init -q "$scripts"
+          git -C "$scripts" fetch --depth=1 --no-tags "git@github.com:${SOURCE_REPO}.git" refs/heads/main
+          git -C "$scripts" checkout -q --detach FETCH_HEAD
+          cp -a "$scripts/ci" ./ci
+          chmod +x ./ci/*.sh
+      - name: Fetch and verify the detected commit
+        env:
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          SOURCE_REF: main
+          SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: bash ci/fetch.sh
+      - name: Expose lockfiles for dependency cache
+        if: matrix.platform != 'android-arm64-v8a'
+        run: |
+          set -euo pipefail
+          mkdir -p web apps/desktop
+          cp "$RUNNER_TEMP/natter-src/web/pnpm-lock.yaml" web/pnpm-lock.yaml
+          cp "$RUNNER_TEMP/natter-src/apps/desktop/pnpm-lock.yaml" apps/desktop/pnpm-lock.yaml
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: matrix.platform != 'android-arm64-v8a'
+        with:
+          cache: pnpm
+          cache-dependency-path: |
+            web/pnpm-lock.yaml
+            apps/desktop/pnpm-lock.yaml
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ${{ runner.temp }}/natter-src -> target
+          shared-key: ${{ matrix.platform }}
+          cache-on-failure: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: matrix.platform != 'android-arm64-v8a'
+        with:
+          pattern: web-*
+          path: web-artifacts
+      - name: Restore prebuilt web assets
+        if: matrix.platform != 'android-arm64-v8a'
+        run: |
+          set -euo pipefail
+          case "${{ matrix.platform }}" in
+            windows-*) mode=desktop ;;
+            *) mode=linux ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/natter-src/web/dist" "$RUNNER_TEMP/natter-src/web/src/new/wasm"
+          cp -a "$GITHUB_WORKSPACE/web-artifacts/web-$mode/." "$RUNNER_TEMP/natter-src/web/dist/"
+          cp "$GITHUB_WORKSPACE/web-artifacts/web-wasm/natter_voice_core_bg.wasm" \
+            "$RUNNER_TEMP/natter-src/web/src/new/wasm/"
+      - name: Stamp the detected version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CODE: ${{ needs.prepare.outputs.code }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/natter-src"
+          sed -i -E "0,/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"$/s//version = \"$VERSION\"/" Cargo.toml
+          grep -Fq "\"version\": \"$VERSION\"" apps/desktop/src-tauri/tauri.conf.json || \
+            sed -i -E "s/\"version\": \"[0-9]+\.[0-9]+\.[0-9]+\"/\"version\": \"$VERSION\"/" apps/desktop/src-tauri/tauri.conf.json
+          sed -i -E "s/versionCode = [0-9]+/versionCode = $CODE/; s/versionName = \"[0-9]+\.[0-9]+\.[0-9]+\"/versionName = \"$VERSION\"/" apps/android/app/build.gradle.kts
+          python - <<'PY'
+          import os, re
+          version = os.environ['VERSION']
+          with open('Cargo.lock', encoding='utf-8') as handle:
+              text = handle.read()
+          text, count = re.subn(
+              r'(\[\[package\]\]\nname = "natter-(?:client|client-core|protocol|server|turn|uniffi|voice-core)"\nversion = ")[^"]+(")',
+              lambda m: m.group(1) + version + m.group(2), text)
+          assert count == 7, f'expected 7 workspace packages, stamped {count}'
+          with open('Cargo.lock', 'w', encoding='utf-8', newline='') as handle:
+              handle.write(text)
+          PY
+      - name: Build and statically audit the release asset
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          RELEASE_MODE: 'true'
+          WEB_PREBUILT: 'true'
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_KEY_PASSWORD }}
+        run: bash ci/package.sh
+      - name: Keep only the asset and its manifest
+        run: |
+          set -euo pipefail
+          mkdir -p "upload/${{ matrix.platform }}"
+          cp plain-out/* "upload/${{ matrix.platform }}/"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: upload/${{ matrix.platform }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  portable:
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true'
+    name: windows-x86_64-slint
+    runs-on: windows-2025
+    environment: release
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Load build scripts from private source
+        env:
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key=$(mktemp)
+          hosts=$(mktemp)
+          printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$key"
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$hosts"
+          export GIT_SSH_COMMAND="ssh -i '$key' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$hosts' -o HostKeyAlgorithms=ssh-ed25519 -o ConnectTimeout=15"
+          scripts=$(mktemp -d)
+          git init -q "$scripts"
+          git -C "$scripts" fetch --depth=1 --no-tags "git@github.com:${SOURCE_REPO}.git" refs/heads/main
+          git -C "$scripts" checkout -q --detach FETCH_HEAD
+          cp -a "$scripts/ci" ./ci
+          chmod +x ./ci/*.sh
+      - name: Fetch and verify the detected commit
+        env:
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          SOURCE_REF: main
+          SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: bash ci/fetch.sh
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ${{ runner.temp }}/natter-src -> target
+          shared-key: ${{ matrix.platform }}
+          cache-on-failure: true
+      - name: Stamp and build the portable client
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CODE: ${{ needs.prepare.outputs.code }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/natter-src"
+          sed -i -E "0,/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"$/s//version = \"$VERSION\"/" Cargo.toml
+          sed -i -E "s/versionCode = [0-9]+/versionCode = $CODE/; s/versionName = \"[0-9]+\.[0-9]+\.[0-9]+\"/versionName = \"$VERSION\"/" apps/android/app/build.gradle.kts
+          python - "$VERSION" <<'PY'
+          import re, sys
+          version = sys.argv[1]
+          with open('Cargo.lock', encoding='utf-8') as handle:
+              text = handle.read()
+          text, count = re.subn(
+              r'(\[\[package\]\]\nname = "natter-(?:client|client-core|protocol|server|turn|uniffi|voice-core)"\nversion = ")[^"]+(")',
+              lambda m: m.group(1) + version + m.group(2), text)
+          assert count == 7, count
+          with open('Cargo.lock', 'w', encoding='utf-8', newline='') as handle:
+              handle.write(text)
+          PY
+          export CARGO_INCREMENTAL=0
+          cargo build --release --locked -p natter-client
+      - name: Package the portable ZIP
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/natter-src"
+          mkdir -p "$GITHUB_WORKSPACE/upload/windows-x86_64-slint"
+          exe=$(find target/release -maxdepth 1 -type f -name 'natter-client.exe' | head -1)
+          test -n "$exe"
+          cp "$exe" "$GITHUB_WORKSPACE/upload/windows-x86_64-slint/natter-client.exe"
+          cp LICENSE "$GITHUB_WORKSPACE/upload/windows-x86_64-slint/"
+          cd "$GITHUB_WORKSPACE/upload/windows-x86_64-slint"
+          7z a -tzip "natter-windows-x86_64-slint.zip" natter-client.exe LICENSE >/dev/null
+          rm natter-client.exe LICENSE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-windows-x86_64-slint
+          path: upload/windows-x86_64-slint/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: [prepare, build, portable]
+    if: needs.prepare.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: incoming
+      - name: Sign APK, verify packages, checksums
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION_CODE: ${{ needs.prepare.outputs.code }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.commit }}
+          SHORT: ${{ needs.prepare.outputs.short }}
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          EXPECTED_CERT_SHA256: ${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          : "${KEYSTORE_BASE64:?Missing release keystore}" "${STORE_PASSWORD:?Missing keystore password}" \
+            "${KEY_ALIAS:?Missing key alias}" "${KEY_PASSWORD:?Missing key password}" \
+            "${EXPECTED_CERT_SHA256:?Missing pinned certificate fingerprint}"
+          tools=$(find "${ANDROID_HOME:?}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          test -x "$tools/apksigner" && test -x "$tools/aapt2"
+          umask 077
+          keystore=$(mktemp)
+          trap 'rm -f "$keystore"' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          mkdir -p dist
+          apk="dist/natter-v$VERSION-g$SHORT-android-arm64-v8a.apk"
+          "$tools/apksigner" sign --ks "$keystore" --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:STORE_PASSWORD --key-pass env:KEY_PASSWORD \
+            --out "$apk" incoming/*/natter-android-arm64-v8a-unsigned.apk
+          cert=$("$tools/apksigner" verify --print-certs "$apk")
+          count=$(grep -cE 'certificate SHA-256 digest:' <<< "$cert")
+          actual=$(sed -nE 's/^(Signer #[0-9]+ |V[0-9]+(\.[0-9]+)? Signer: )certificate SHA-256 digest: ([[:xdigit:]]{64})$/\3/p' <<< "$cert")
+          if [[ "$count" != 1 || ! "$actual" =~ ^[[:xdigit:]]{64}$ || "${actual,,}" != "${EXPECTED_CERT_SHA256,,}" ]]; then
+            echo 'APK must have exactly one signer matching the pinned release certificate.' >&2
+            exit 1
+          fi
+          badging=$("$tools/aapt2" dump badging "$apk")
+          grep -Fq "package: name='app.natter.android' versionCode='$VERSION_CODE' versionName='$VERSION'" <<< "$badging"
+          grep -Fq "native-code: 'arm64-v8a'" <<< "$badging"
+          # Every asset must come from the exact detected private commit.
+          python - <<'PY'
+          import glob, json, os
+          commit = os.environ['SOURCE_COMMIT']
+          manifests = sorted(glob.glob('incoming/*/audit-manifest.json'))
+          assert len(manifests) == 4, f'expected 4 platform manifests, found {len(manifests)}'
+          platforms = set()
+          for path in manifests:
+              data = json.load(open(path, encoding='utf-8'))
+              assert data['private_commit'] == commit, 'manifest commit mismatch'
+              platforms.add(data['platform'])
+          assert platforms == {'linux-x86_64', 'linux-aarch64', 'windows-x86_64',
+                               'android-arm64-v8a'}, platforms
+          PY
+          mv incoming/*/natter-linux-x86_64.tar.gz "dist/natter-v$VERSION-g$SHORT-linux-x86_64.tar.gz"
+          mv incoming/*/natter-linux-aarch64.tar.gz "dist/natter-v$VERSION-g$SHORT-linux-aarch64.tar.gz"
+          mv incoming/*/natter-windows-x86_64-setup.exe "dist/natter-v$VERSION-g$SHORT-windows-x86_64-setup.exe"
+          mv incoming/*/natter-windows-x86_64-slint.zip "dist/natter-v$VERSION-g$SHORT-windows-x86_64-slint.zip"
+          (cd dist && sha256sum ./*.tar.gz ./*.exe ./*.apk ./*.zip | sed 's/  \.\//  /' > SHA256SUMS)
+      - name: Publish versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHORT: ${{ needs.prepare.outputs.short }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code "https://github.com/$GH_REPO.git" "refs/tags/$TAG"; then
+            echo "Public tag $TAG already exists; refusing to reuse it." >&2
+            exit 1
+          else
+            status=$?
+            test "$status" -eq 2
+          fi
+          cat > release-notes.md <<EOF
+          Natter $VERSION
+
+          - Linux x86-64 / arm64 server bundle (server + Web client + deploy scripts)
+          - Windows x64 NSIS installer (Tauri)
+          - Windows x64 portable ZIP (Slint client)
+          - Android arm64 APK, signed with the pinned Natter release certificate
+
+          Windows binaries are not Authenticode-signed. The Android signing key changed in this
+          release, so APKs up to v0.1.9 cannot be updated in place: uninstall the old app first.
+          Windows builds from v0.1.11 update themselves from 设置 → 关于; older installs need one
+          manual upgrade.
+
+          Source commit: \`$SOURCE_COMMIT\`
+          Release tag: \`$TAG\`
+          EOF
+          python - <<'PY'
+          import glob, json, os
+          from datetime import datetime, timezone
+          version = os.environ['VERSION']
+          short = os.environ['SHORT']
+          repo = os.environ['GH_REPO']
+          signature = None
+          for path in glob.glob('incoming/*/audit-manifest.json'):
+              data = json.load(open(path, encoding='utf-8'))
+              if data.get('platform') == 'windows-x86_64':
+                  signature = (data.get('updater_signature') or '').strip()
+                  break
+          if not signature:
+              raise SystemExit('windows manifest has no updater signature')
+          payload = {
+              'version': version,
+              'notes': f'Natter {version}。更新内容见 Release 页面。',
+              'pub_date': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'platforms': {
+                  'windows-x86_64': {
+                      'signature': signature,
+                      'url': f'https://github.com/{repo}/releases/download/v{version}-g{short}/natter-v{version}-g{short}-windows-x86_64-setup.exe',
+                  },
+              },
+          }
+          with open('dist/latest.json', 'w', encoding='utf-8') as handle:
+              json.dump(payload, handle, ensure_ascii=False, indent=2)
+              handle.write('\n')
+          PY
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" --title "Natter $VERSION (g$SHORT)" --notes-file release-notes.md --latest
