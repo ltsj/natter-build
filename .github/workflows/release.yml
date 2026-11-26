@@ -140,15 +140,13 @@ jobs:
       - name: Expose lockfiles for dependency cache
         run: |
           set -euo pipefail
-          mkdir -p web apps/desktop
+          mkdir -p web
           cp "$RUNNER_TEMP/natter-src/web/pnpm-lock.yaml" web/pnpm-lock.yaml
-          cp "$RUNNER_TEMP/natter-src/apps/desktop/pnpm-lock.yaml" apps/desktop/pnpm-lock.yaml
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           cache: pnpm
           cache-dependency-path: |
             web/pnpm-lock.yaml
-            apps/desktop/pnpm-lock.yaml
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: ${{ runner.temp }}/natter-src -> target
@@ -268,16 +266,14 @@ jobs:
         if: matrix.platform != 'android-arm64-v8a'
         run: |
           set -euo pipefail
-          mkdir -p web apps/desktop
+          mkdir -p web
           cp "$RUNNER_TEMP/natter-src/web/pnpm-lock.yaml" web/pnpm-lock.yaml
-          cp "$RUNNER_TEMP/natter-src/apps/desktop/pnpm-lock.yaml" apps/desktop/pnpm-lock.yaml
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: matrix.platform != 'android-arm64-v8a'
         with:
           cache: pnpm
           cache-dependency-path: |
             web/pnpm-lock.yaml
-            apps/desktop/pnpm-lock.yaml
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: ${{ runner.temp }}/natter-src -> target
@@ -308,8 +304,7 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/natter-src"
           sed -i -E "0,/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"$/s//version = \"$VERSION\"/" Cargo.toml
-          grep -Fq "\"version\": \"$VERSION\"" apps/desktop/src-tauri/tauri.conf.json || \
-            sed -i -E "s/\"version\": \"[0-9]+\.[0-9]+\.[0-9]+\"/\"version\": \"$VERSION\"/" apps/desktop/src-tauri/tauri.conf.json
+          sed -i -E "0,/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"$/s//version = \"$VERSION\"/" apps/desktop-gpui/Cargo.toml
           sed -i -E "s/versionCode = [0-9]+/versionCode = $CODE/; s/versionName = \"[0-9]+\.[0-9]+\.[0-9]+\"/versionName = \"$VERSION\"/" apps/android/app/build.gradle.kts
           python - <<'PY'
           import os, re
@@ -317,10 +312,18 @@ jobs:
           with open('Cargo.lock', encoding='utf-8') as handle:
               text = handle.read()
           text, count = re.subn(
-              r'(\[\[package\]\]\nname = "natter-(?:client|client-core|protocol|server|turn|uniffi|voice-core)"\nversion = ")[^"]+(")',
+              r'(\[\[package\]\]\nname = "natter-(?:client-core|protocol|server|turn|uniffi|voice-core)"\nversion = ")[^"]+(")',
               lambda m: m.group(1) + version + m.group(2), text)
-          assert count == 7, f'expected 7 workspace packages, stamped {count}'
+          assert count == 6, f'expected 6 workspace packages, stamped {count}'
           with open('Cargo.lock', 'w', encoding='utf-8', newline='') as handle:
+              handle.write(text)
+          with open('apps/desktop-gpui/Cargo.lock', encoding='utf-8') as handle:
+              text = handle.read()
+          text, count = re.subn(
+              r'(\[\[package\]\]\nname = "natter-desktop-gpui"\nversion = ")[^"]+(")',
+              lambda m: m.group(1) + version + m.group(2), text)
+          assert count == 1, f'expected the GPUI package, stamped {count}'
+          with open('apps/desktop-gpui/Cargo.lock', 'w', encoding='utf-8', newline='') as handle:
               handle.write(text)
           PY
       - name: Build and statically audit the release asset
@@ -330,8 +333,6 @@ jobs:
           WEB_PREBUILT: 'true'
           SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
           SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_KEY_PASSWORD }}
         run: bash ci/package.sh
       - name: Keep only the asset and its manifest
         run: |
@@ -346,97 +347,8 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-  portable:
-    needs: prepare
-    if: needs.prepare.outputs.ready == 'true'
-    name: windows-x86_64-slint
-    runs-on: windows-2025
-    environment: release
-    timeout-minutes: 45
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Load build scripts from private source
-        env:
-          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
-          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
-        run: |
-          set -euo pipefail
-          umask 077
-          key=$(mktemp)
-          hosts=$(mktemp)
-          printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$key"
-          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$hosts"
-          export GIT_SSH_COMMAND="ssh -i '$key' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$hosts' -o HostKeyAlgorithms=ssh-ed25519 -o ConnectTimeout=15"
-          scripts=$(mktemp -d)
-          git init -q "$scripts"
-          git -C "$scripts" fetch --depth=1 --no-tags "git@github.com:${SOURCE_REPO}.git" refs/heads/main
-          git -C "$scripts" checkout -q --detach FETCH_HEAD
-          cp -a "$scripts/ci" ./ci
-          chmod +x ./ci/*.sh
-      - name: Fetch and verify the detected commit
-        env:
-          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
-          SOURCE_REF: main
-          SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
-          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
-        run: bash ci/fetch.sh
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          workspaces: ${{ runner.temp }}/natter-src -> target
-          shared-key: ${{ matrix.platform }}
-          cache-on-failure: true
-      - name: Stamp and build the portable client
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          CODE: ${{ needs.prepare.outputs.code }}
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/natter-src"
-          sed -i -E "0,/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"$/s//version = \"$VERSION\"/" Cargo.toml
-          sed -i -E "s/versionCode = [0-9]+/versionCode = $CODE/; s/versionName = \"[0-9]+\.[0-9]+\.[0-9]+\"/versionName = \"$VERSION\"/" apps/android/app/build.gradle.kts
-          python - "$VERSION" <<'PY'
-          import re, sys
-          version = sys.argv[1]
-          with open('Cargo.lock', encoding='utf-8') as handle:
-              text = handle.read()
-          text, count = re.subn(
-              r'(\[\[package\]\]\nname = "natter-(?:client|client-core|protocol|server|turn|uniffi|voice-core)"\nversion = ")[^"]+(")',
-              lambda m: m.group(1) + version + m.group(2), text)
-          assert count == 7, count
-          with open('Cargo.lock', 'w', encoding='utf-8', newline='') as handle:
-              handle.write(text)
-          PY
-          export CARGO_INCREMENTAL=0
-          cargo build --release --locked -p natter-client
-      - name: Package the portable ZIP
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/natter-src"
-          mkdir -p "$GITHUB_WORKSPACE/upload/windows-x86_64-slint"
-          exe=$(find target/release -maxdepth 1 -type f -name 'natter-client.exe' | head -1)
-          test -n "$exe"
-          cp "$exe" "$GITHUB_WORKSPACE/upload/windows-x86_64-slint/natter-client.exe"
-          cp LICENSE "$GITHUB_WORKSPACE/upload/windows-x86_64-slint/"
-          cd "$GITHUB_WORKSPACE/upload/windows-x86_64-slint"
-          7z a -tzip "natter-windows-x86_64-slint.zip" natter-client.exe LICENSE >/dev/null
-          rm natter-client.exe LICENSE
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-windows-x86_64-slint
-          path: upload/windows-x86_64-slint/
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
-
   publish:
-    needs: [prepare, build, portable]
+    needs: [prepare, build]
     if: needs.prepare.outputs.ready == 'true'
     runs-on: ubuntu-24.04
     environment: release
@@ -501,9 +413,8 @@ jobs:
           PY
           mv incoming/*/natter-linux-x86_64.tar.gz "dist/natter-v$VERSION-g$SHORT-linux-x86_64.tar.gz"
           mv incoming/*/natter-linux-aarch64.tar.gz "dist/natter-v$VERSION-g$SHORT-linux-aarch64.tar.gz"
-          mv incoming/*/natter-windows-x86_64-setup.exe "dist/natter-v$VERSION-g$SHORT-windows-x86_64-setup.exe"
-          mv incoming/*/natter-windows-x86_64-slint.zip "dist/natter-v$VERSION-g$SHORT-windows-x86_64-slint.zip"
-          (cd dist && sha256sum ./*.tar.gz ./*.exe ./*.apk ./*.zip | sed 's/  \.\//  /' > SHA256SUMS)
+          mv incoming/*/natter-windows-x86_64-gpui.zip "dist/natter-v$VERSION-g$SHORT-windows-x86_64-gpui.zip"
+          (cd dist && sha256sum ./*.tar.gz ./*.zip ./*.apk | sed 's/  \.\//  /' > SHA256SUMS)
       - name: Publish versioned release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -529,46 +440,15 @@ jobs:
           Natter $VERSION
 
           - Linux x86-64 / arm64 server bundle (server + Web client + deploy scripts)
-          - Windows x64 NSIS installer (Tauri)
-          - Windows x64 portable ZIP (Slint client)
+          - Windows x64 portable ZIP (GPUI native client)
           - Android arm64 APK, signed with the pinned Natter release certificate
 
           Windows binaries are not Authenticode-signed. The Android signing key changed in this
           release, so APKs up to v0.1.9 cannot be updated in place: uninstall the old app first.
-          Windows builds from v0.1.11 update themselves from 设置 → 关于; older installs need one
-          manual upgrade.
+          Windows GPUI builds are portable ZIPs; replace the extracted folder to upgrade.
 
           Source commit: \`$SOURCE_COMMIT\`
           Release tag: \`$TAG\`
           EOF
-          python - <<'PY'
-          import glob, json, os
-          from datetime import datetime, timezone
-          version = os.environ['VERSION']
-          short = os.environ['SHORT']
-          repo = os.environ['GH_REPO']
-          signature = None
-          for path in glob.glob('incoming/*/audit-manifest.json'):
-              data = json.load(open(path, encoding='utf-8'))
-              if data.get('platform') == 'windows-x86_64':
-                  signature = (data.get('updater_signature') or '').strip()
-                  break
-          if not signature:
-              raise SystemExit('windows manifest has no updater signature')
-          payload = {
-              'version': version,
-              'notes': f'Natter {version}。更新内容见 Release 页面。',
-              'pub_date': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-              'platforms': {
-                  'windows-x86_64': {
-                      'signature': signature,
-                      'url': f'https://github.com/{repo}/releases/download/v{version}-g{short}/natter-v{version}-g{short}-windows-x86_64-setup.exe',
-                  },
-              },
-          }
-          with open('dist/latest.json', 'w', encoding='utf-8') as handle:
-              json.dump(payload, handle, ensure_ascii=False, indent=2)
-              handle.write('\n')
-          PY
           gh release create "$TAG" dist/* \
             --target "$GITHUB_SHA" --title "Natter $VERSION (g$SHORT)" --notes-file release-notes.md --latest
