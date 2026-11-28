@@ -112,24 +112,6 @@ jobs:
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 12
-      - name: Load build scripts from private source
-        env:
-          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
-          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
-        run: |
-          set -euo pipefail
-          umask 077
-          key=$(mktemp)
-          hosts=$(mktemp)
-          printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$key"
-          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$hosts"
-          export GIT_SSH_COMMAND="ssh -i '$key' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$hosts' -o HostKeyAlgorithms=ssh-ed25519 -o ConnectTimeout=15"
-          scripts=$(mktemp -d)
-          git init -q "$scripts"
-          git -C "$scripts" fetch --depth=1 --no-tags "git@github.com:${SOURCE_REPO}.git" refs/heads/main
-          git -C "$scripts" checkout -q --detach FETCH_HEAD
-          cp -a "$scripts/ci" ./ci
-          chmod +x ./ci/*.sh
       - name: Fetch and verify the detected commit
         env:
           SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
@@ -151,7 +133,7 @@ jobs:
         with:
           workspaces: ${{ runner.temp }}/natter-src -> target
           cache-targets: false
-      - name: Build web and voice WASM once
+      - name: Build web and both WASM cores once
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/natter-src"
@@ -166,20 +148,22 @@ jobs:
                 {loader:"js", minify:true, legalComments:"inline", sourcemap:false});
               await writeFile(f, code);
             }')
-          stage=web
-          pnpm -C web run build:voice-wasm
-          python "$GITHUB_WORKSPACE/ci/strip-wasm.py" web/src/new/wasm/natter_voice_core_bg.wasm
-          python "$GITHUB_WORKSPACE/ci/audit.py" wasm web/src/new/wasm/natter_voice_core_bg.wasm > /dev/null
+          pnpm -C web run build:wasm
+          python "$RUNNER_TEMP/natter-src/ci/strip-wasm.py" web/src/new/wasm/natter_voice_core_bg.wasm
+          python "$RUNNER_TEMP/natter-src/ci/strip-wasm.py" web/src/new/wasm/natter_client_core_bg.wasm
+          python "$RUNNER_TEMP/natter-src/ci/audit.py" wasm web/src/new/wasm/natter_voice_core_bg.wasm > /dev/null
+          python "$RUNNER_TEMP/natter-src/ci/audit.py" wasm web/src/new/wasm/natter_client_core_bg.wasm > /dev/null
           (cd web && node --import ./scripts/init-wasm-tests.mjs --test)
           pnpm -C web exec vite build
           rm -rf web/dist/.vite
-          python "$GITHUB_WORKSPACE/ci/audit.py" scan-tree web/dist > /dev/null
+          python "$RUNNER_TEMP/natter-src/ci/audit.py" scan-tree web/dist > /dev/null
           cp -a web/dist "$RUNNER_TEMP/web-dist-linux"
           pnpm -C web exec vite build --mode desktop
           rm -rf web/dist/.vite
-          python "$GITHUB_WORKSPACE/ci/audit.py" scan-tree web/dist > /dev/null
+          python "$RUNNER_TEMP/natter-src/ci/audit.py" scan-tree web/dist > /dev/null
           mkdir -p "$GITHUB_WORKSPACE/out/wasm" "$GITHUB_WORKSPACE/out/linux" "$GITHUB_WORKSPACE/out/desktop"
           cp web/src/new/wasm/natter_voice_core_bg.wasm "$GITHUB_WORKSPACE/out/wasm/"
+          cp web/src/new/wasm/natter_client_core_bg.wasm "$GITHUB_WORKSPACE/out/wasm/"
           cp -a "$RUNNER_TEMP/web-dist-linux/." "$GITHUB_WORKSPACE/out/linux/"
           cp -a web/dist/. "$GITHUB_WORKSPACE/out/desktop/"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -237,24 +221,6 @@ jobs:
         if: matrix.platform == 'android-arm64-v8a'
         with:
           log-accepted-android-sdk-licenses: false
-      - name: Load build scripts from private source
-        env:
-          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
-          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
-        run: |
-          set -euo pipefail
-          umask 077
-          key=$(mktemp)
-          hosts=$(mktemp)
-          printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$key"
-          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$hosts"
-          export GIT_SSH_COMMAND="ssh -i '$key' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$hosts' -o HostKeyAlgorithms=ssh-ed25519 -o ConnectTimeout=15"
-          scripts=$(mktemp -d)
-          git init -q "$scripts"
-          git -C "$scripts" fetch --depth=1 --no-tags "git@github.com:${SOURCE_REPO}.git" refs/heads/main
-          git -C "$scripts" checkout -q --detach FETCH_HEAD
-          cp -a "$scripts/ci" ./ci
-          chmod +x ./ci/*.sh
       - name: Fetch and verify the detected commit
         env:
           SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
@@ -294,7 +260,7 @@ jobs:
           esac
           mkdir -p "$RUNNER_TEMP/natter-src/web/dist" "$RUNNER_TEMP/natter-src/web/src/new/wasm"
           cp -a "$GITHUB_WORKSPACE/web-artifacts/web-$mode/." "$RUNNER_TEMP/natter-src/web/dist/"
-          cp "$GITHUB_WORKSPACE/web-artifacts/web-wasm/natter_voice_core_bg.wasm" \
+          cp "$GITHUB_WORKSPACE/web-artifacts/web-wasm/"*.wasm \
             "$RUNNER_TEMP/natter-src/web/src/new/wasm/"
       - name: Stamp the detected version
         env:
@@ -333,7 +299,10 @@ jobs:
           WEB_PREBUILT: 'true'
           SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
           SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
-        run: bash ci/package.sh
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/natter-src"
+          bash ci/package.sh
       - name: Keep only the asset and its manifest
         run: |
           set -euo pipefail
