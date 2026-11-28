@@ -139,6 +139,8 @@ jobs:
           cd "$RUNNER_TEMP/natter-src"
           rustup target add wasm32-unknown-unknown
           cargo install wasm-pack --version 0.13.1 --locked
+          # wasm-pack 会把构建目录与工具链绝对路径写进 panic 字符串；发布产物先重映射再构建。
+          export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$PWD=app"$'\x1f'"--remap-path-prefix=$HOME=toolchain"
           pnpm -C web install --frozen-lockfile
           (cd web && node --input-type=module -e '
             import {readFile, writeFile} from "node:fs/promises";
@@ -151,16 +153,16 @@ jobs:
           pnpm -C web run build:wasm
           python "$RUNNER_TEMP/natter-src/ci/strip-wasm.py" web/src/new/wasm/natter_voice_core_bg.wasm
           python "$RUNNER_TEMP/natter-src/ci/strip-wasm.py" web/src/new/wasm/natter_client_core_bg.wasm
-          python "$RUNNER_TEMP/natter-src/ci/audit.py" wasm web/src/new/wasm/natter_voice_core_bg.wasm > /dev/null
-          python "$RUNNER_TEMP/natter-src/ci/audit.py" wasm web/src/new/wasm/natter_client_core_bg.wasm > /dev/null
+          python "$RUNNER_TEMP/natter-src/ci/audit.py" wasm web/src/new/wasm/natter_voice_core_bg.wasm > "$RUNNER_TEMP/audit-wasm-voice.json" || { cat "$RUNNER_TEMP/audit-wasm-voice.json"; exit 1; }
+          python "$RUNNER_TEMP/natter-src/ci/audit.py" wasm web/src/new/wasm/natter_client_core_bg.wasm > "$RUNNER_TEMP/audit-wasm-client.json" || { cat "$RUNNER_TEMP/audit-wasm-client.json"; exit 1; }
           (cd web && node --import ./scripts/init-wasm-tests.mjs --test)
           pnpm -C web exec vite build
           rm -rf web/dist/.vite
-          python "$RUNNER_TEMP/natter-src/ci/audit.py" scan-tree web/dist > /dev/null
+          python "$RUNNER_TEMP/natter-src/ci/audit.py" scan-tree web/dist > "$RUNNER_TEMP/audit-linux.json" || { cat "$RUNNER_TEMP/audit-linux.json"; exit 1; }
           cp -a web/dist "$RUNNER_TEMP/web-dist-linux"
           pnpm -C web exec vite build --mode desktop
           rm -rf web/dist/.vite
-          python "$RUNNER_TEMP/natter-src/ci/audit.py" scan-tree web/dist > /dev/null
+          python "$RUNNER_TEMP/natter-src/ci/audit.py" scan-tree web/dist > "$RUNNER_TEMP/audit-desktop.json" || { cat "$RUNNER_TEMP/audit-desktop.json"; exit 1; }
           mkdir -p "$GITHUB_WORKSPACE/out/wasm" "$GITHUB_WORKSPACE/out/linux" "$GITHUB_WORKSPACE/out/desktop"
           cp web/src/new/wasm/natter_voice_core_bg.wasm "$GITHUB_WORKSPACE/out/wasm/"
           cp web/src/new/wasm/natter_client_core_bg.wasm "$GITHUB_WORKSPACE/out/wasm/"
